@@ -9,7 +9,9 @@
 {-# LANGUAGE JavaScriptFFI #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 
@@ -38,8 +40,12 @@ import CodeWorld.Picture
 import Control.Concurrent
 import Control.Exception
 import Control.Monad
+import Control.Monad.Fix
+import Control.Monad.Identity
 import Control.Monad.Trans (liftIO)
 import Data.Char (chr)
+import Data.Dependent.Map (DSum(..))
+import Data.IORef
 import Data.List (zip4, intercalate)
 import Data.Maybe
 import Data.Serialize
@@ -51,6 +57,8 @@ import GHC.Generics
 import GHC.Stack
 import GHC.StaticPtr
 import Numeric (showFFloatAlt)
+import qualified Reflex as R
+import qualified Reflex.Host.Class as R
 import System.IO.Unsafe
 import System.Mem.StableName
 import System.Random
@@ -83,6 +91,7 @@ import GHCJS.Marshal
 import GHCJS.Marshal.Pure
 import GHCJS.Types
 import JavaScript.Object
+import JavaScript.Web.AnimationFrame
 import qualified JavaScript.Web.Canvas as Canvas
 import qualified JavaScript.Web.Canvas.Internal as Canvas
 import qualified JavaScript.Web.Location as Loc
@@ -887,6 +896,18 @@ runBlankCanvas act = do
 --------------------------------------------------------------------------------
 -- Common event handling and core interaction code
 
+data ReactiveInput t = ReactiveInput {
+    keyPress :: R.Event t Text,
+    keyRelease :: R.Event t Text,
+    textEntry :: R.Event t Text,
+    pointerPress :: R.Event t Point,
+    pointerRelease :: R.Event t Point,
+    pointerPosition :: R.Dynamic t Point,
+    pointerDown :: R.Dynamic t Bool,
+    timePassing :: R.Event t Double,
+    currentTime :: R.Dynamic t Double
+    }
+
 keyCodeToText :: Word -> Text
 keyCodeToText n =
     case n of
@@ -1568,6 +1589,117 @@ replaceDrawNode n with drawing = either Just (const Nothing) $ go n drawing
     mapLeft :: (a -> b) -> Either a c -> Either b c
     mapLeft f = either (Left . f) Right
 
+runReactive
+    :: (forall t m. (R.Reflex t, R.MonadHold t m, MonadFix m)
+        => (ReactiveInput t -> m (R.Dynamic t Picture)))
+    -> IO ()
+runReactive program = do
+    showCanvas
+
+    Just window <- currentWindow
+    Just doc <- currentDocument
+    Just canvas <- getElementById doc ("screen" :: JSString)
+
+    offscreenCanvas <- Canvas.create 500 500
+    setCanvasSize canvas canvas
+    setCanvasSize (elementFromCanvas offscreenCanvas) canvas
+    screen <- getCodeWorldContext (canvasFromElement canvas)
+
+    let frame (Just pic) = do
+            rect <- getBoundingClientRect canvas
+            withScreen (elementFromCanvas offscreenCanvas) rect $
+                drawFrame (pictureToDrawing pic)
+            rect <- getBoundingClientRect canvas
+            cw <- ClientRect.getWidth rect
+            ch <- ClientRect.getHeight rect
+            when (cw > 0 && ch > 0) $ canvasDrawImage
+                screen
+                (elementFromCanvas offscreenCanvas)
+                0
+                0
+                (round cw)
+                (round ch)
+        frame Nothing = return ()
+
+    rec
+        keyPress <- R.runSpiderHost $ R.newEventWithTrigger $ \trigger ->
+            on window keyDown $ do
+                keyName <- keyCodeToText <$> (getKeyCode =<< event)
+                when (keyName /= "") $ do
+                    liftIO $ sendEvents [ trigger :=> Identity keyName ]
+                    preventDefault
+                    stopPropagation
+        textEntry <- R.runSpiderHost $ R.newEventWithTrigger $ \trigger ->
+            on window keyDown $ do
+                key <- getKey =<< event
+                when (T.length key == 1) $ do
+                    liftIO $ sendEvents [trigger :=> Identity key]
+                    preventDefault
+                    stopPropagation
+        keyRelease <- R.runSpiderHost $ R.newEventWithTrigger $ \trigger ->
+            on window keyUp $ do
+                keyName <- keyCodeToText <$> (getKeyCode =<< event)
+                when (keyName /= "") $ do
+                    liftIO $ sendEvents [trigger :=> Identity keyName]
+                    preventDefault
+                    stopPropagation
+        pointerPress <- R.runSpiderHost $ R.newEventWithTrigger $ \trigger ->
+            on window mouseDown $ do
+                pos <- getMousePos canvas
+                liftIO $ sendEvents [trigger :=> Identity pos]
+        pointerRelease <- R.runSpiderHost $ R.newEventWithTrigger $ \trigger ->
+            on window mouseUp $ do
+                pos <- getMousePos canvas
+                liftIO $ sendEvents [trigger :=> Identity pos]
+        pointerMovement <- R.runSpiderHost $ R.newEventWithTrigger $ \trigger ->
+            on window mouseMove $ do
+                pos <- getMousePos canvas
+                liftIO $ sendEvents [trigger :=> Identity pos]
+
+        t0 <- getTime
+        timeTick <- R.runSpiderHost $ R.newEventWithTrigger $ \trigger -> do
+            active <- newIORef True
+            let timeStep t = do
+                    stillActive <- readIORef active
+                    when stillActive $ do
+                        sendEvents [trigger :=> Identity (t - t0)]
+                        void $ inAnimationFrame ContinueAsync timeStep
+            void $ inAnimationFrame ContinueAsync timeStep
+            return (writeIORef active False)
+
+        currentTime <- R.runSpiderHost $ R.holdDyn 0 ((/ 1000) <$> timeTick)
+        timePassing <- R.runSpiderHost $ R.ffilter (> 0) <$> diffsWith (-) 0 currentTime
+        pointerPosition <- R.runSpiderHost $ R.holdDyn (0, 0) pointerMovement
+        pointerDown <- R.runSpiderHost $ R.holdDyn False $
+            R.mergeWith (&&) [True <$ pointerPress, False <$ pointerRelease]
+
+        dynPicture <- R.runSpiderHost $ R.runHostFrame $ program ReactiveInput{..}
+
+        pictureHandle <- R.runSpiderHost $ R.subscribeEvent (R.updated dynPicture)
+        let sendEvents events = do
+                pic <- R.runSpiderHost $ R.fireEventsAndRead events $
+                    R.readEvent pictureHandle >>= sequence
+                frame pic
+
+    let redraw = do
+            pic <- R.runSpiderHost $
+                R.runHostFrame $ R.sample $ R.current dynPicture
+            frame (Just pic)
+
+    _ <- on window resize $ liftIO $ do
+        setCanvasSize canvas canvas
+        setCanvasSize (elementFromCanvas offscreenCanvas) canvas
+        redraw
+
+    redraw
+    waitForever
+
+diffsWith :: (R.Reflex t, R.MonadHold t m, MonadFix m)
+          => (a -> a -> b) -> a -> R.Dynamic t a -> m (R.Event t b)
+diffsWith f start dyn = do
+    pairs <- R.foldDyn (\new (old, _) -> (new, old)) (start, start) (R.updated dyn)
+    return $ uncurry f <$> R.updated pairs
+
 #else
 
 --------------------------------------------------------------------------------
@@ -1599,12 +1731,9 @@ toEvent rect Canvas.Event {..}
     | otherwise = Nothing
 
 onEvents :: Canvas.DeviceContext -> (Int, Int) -> (Event -> IO ()) -> IO ()
-onEvents context rect handler =
-    void $
-    forkIO $
-    forever $ do
-        maybeEvent <- toEvent rect <$> Canvas.wait context
-        forM_ maybeEvent handler
+onEvents context rect handler = void $ forkIO $ forever $ do
+    maybeEvent <- toEvent rect <$> Canvas.wait context
+    forM_ maybeEvent handler
 
 run :: s -> (Double -> s -> s) -> (Event -> s -> s) -> (s -> Picture) -> IO ()
 run initial stepHandler eventHandler drawHandler =
@@ -1675,5 +1804,80 @@ runGame
     -> (Int -> s -> Picture)
     -> IO ()
 runGame = error "game API unimplemented in stand-alone interface mode"
+
+runReactive
+    :: (forall t m. (R.Reflex t, R.MonadHold t m, MonadFix m)
+        => ReactiveInput t -> m (R.Dynamic t Picture))
+    -> IO ()
+runReactive program = runBlankCanvas $ \context -> do
+    let cw = Canvas.width context
+    let ch = Canvas.height context
+    offscreenCanvas <- runCanvasM context $ CM.newImage cw ch
+
+    let frame (Just pic) = do
+            runCanvasM context $ do
+                CM.withImage offscreenCanvas $
+                    CM.saveRestore $ do
+                        setupScreenContext cw ch
+                        drawDrawing initialDS (pictureToDrawing pic)
+                CM.drawImage offscreenCanvas 0 0 cw ch
+        frame Nothing = return ()
+
+    (keyPress, keyPressTrigger) <- R.runSpiderHost R.newEventWithTriggerRef
+    (textEntry, textEntryTrigger) <- R.runSpiderHost R.newEventWithTriggerRef
+    (keyRelease, keyReleaseTrigger) <- R.runSpiderHost R.newEventWithTriggerRef
+    (pointerPress, pointerPressTrigger) <- R.runSpiderHost R.newEventWithTriggerRef
+    (pointerRelease, pointerReleaseTrigger) <- R.runSpiderHost R.newEventWithTriggerRef
+    (pointerMovement, pointerMovementTrigger) <- R.runSpiderHost R.newEventWithTriggerRef
+    (timePassing, timePassingTrigger) <- R.runSpiderHost R.newEventWithTriggerRef
+
+    pointerPosition <- R.runSpiderHost $ R.holdDyn (0, 0) pointerMovement
+    pointerDown <- R.runSpiderHost $ R.holdDyn False $
+        R.mergeWith (&&) [True <$ pointerPress, False <$ pointerRelease]
+    currentTime <- R.runSpiderHost $ R.foldDyn (+) 0 timePassing
+
+    let input = ReactiveInput{..}
+
+    (dynPicture, pictureHandle) <- R.runSpiderHost $ do
+        pic <- R.runHostFrame (program input)
+        handle <- R.subscribeEvent (R.updated pic)
+        return (pic, handle)
+
+    let redraw = do
+            pic <- R.runSpiderHost $
+                R.runHostFrame $ R.sample $ R.current dynPicture
+            frame (Just pic)
+
+    let sendEvent trigger val = do
+            pic <- R.runSpiderHost $
+                R.fireEventRefAndRead trigger val pictureHandle
+            frame pic
+
+    redraw
+    let go t0 = do
+            events <- Canvas.flush context
+            forM_ events $ \event -> case Canvas.eType event of
+                "keydown" | Just code <- Canvas.eWhich event -> do
+                    let keyName = keyCodeToText (fromIntegral code)
+                    sendEvent keyPressTrigger keyName
+                    when (T.length keyName == 1) $ sendEvent textEntryTrigger keyName
+                "keyup" | Just code <- Canvas.eWhich event -> do
+                    let keyName = keyCodeToText (fromIntegral code)
+                    sendEvent keyReleaseTrigger keyName
+                "mousedown" | Just pos <- getMousePos (cw, ch) <$> Canvas.ePageXY event -> do
+                    sendEvent pointerPressTrigger pos
+                "mouseup" | Just pos <- getMousePos (cw, ch) <$> Canvas.ePageXY event -> do
+                    sendEvent pointerReleaseTrigger pos
+                "mousemove" | Just pos <- getMousePos (cw, ch) <$> Canvas.ePageXY event -> do
+                    sendEvent pointerMovementTrigger pos
+                _ -> return ()
+
+            tn <- getCurrentTime
+            threadDelay $ max 0 (50000 - (round ((tn `diffUTCTime` t0) * 1000000)))
+            t1 <- getCurrentTime
+            let dt = min 0.25 $ realToFrac (t1 `diffUTCTime` t0)
+            sendEvent timePassingTrigger dt
+            go t1
+    go =<< getCurrentTime
 
 #endif
